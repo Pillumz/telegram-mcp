@@ -1,5 +1,6 @@
 import os
 import sys
+import io
 import json
 import time
 import asyncio
@@ -9,6 +10,13 @@ import mimetypes
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import List, Dict, Optional, Union, Any
+
+# Starlette for HTTP endpoints
+from starlette.applications import Starlette
+from starlette.routing import Route, Mount
+from starlette.responses import Response, JSONResponse
+from starlette.requests import Request
+import uvicorn
 
 # Third-party libraries
 import nest_asyncio
@@ -62,6 +70,14 @@ TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME")
 
 # Check if a string session exists in environment, otherwise use file-based session
 SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
+
+# File transfer configuration
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB max file size for HTTP transfers
+
+# MCP server configuration (for SSE transport)
+MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
+MCP_PORT = int(os.getenv("MCP_PORT", "8080"))
+MCP_PATH_PREFIX = os.getenv("MCP_PATH_PREFIX", "/mcp")  # Secret path prefix for security
 
 mcp = FastMCP("telegram")
 
@@ -317,6 +333,46 @@ def get_sender_name(message) -> str:
         return "Unknown"
 
 
+def get_media_indicator(media) -> str:
+    """Return a short indicator for media type, or empty string if no media."""
+    if not media:
+        return ""
+
+    type_name = type(media).__name__
+    indicators = {
+        "MessageMediaPhoto": "[Photo]",
+        "MessageMediaDocument": "[Document]",
+        "MessageMediaVideo": "[Video]",
+        "MessageMediaAudio": "[Audio]",
+        "MessageMediaGeo": "[Location]",
+        "MessageMediaVenue": "[Venue]",
+        "MessageMediaContact": "[Contact]",
+        "MessageMediaPoll": "[Poll]",
+        "MessageMediaDice": "[Dice]",
+        "MessageMediaGame": "[Game]",
+        "MessageMediaWebPage": "[Link]",
+        "MessageMediaStory": "[Story]",
+        "MessageMediaGeoLive": "[LiveLocation]",
+    }
+
+    # For documents, check if it's actually video/audio/sticker/gif
+    if type_name == "MessageMediaDocument" and hasattr(media, "document") and media.document:
+        for attr in media.document.attributes:
+            attr_name = type(attr).__name__
+            if attr_name == "DocumentAttributeVideo":
+                return "[Video]"
+            elif attr_name == "DocumentAttributeAudio":
+                if getattr(attr, "voice", False):
+                    return "[Voice]"
+                return "[Audio]"
+            elif attr_name == "DocumentAttributeSticker":
+                return "[Sticker]"
+            elif attr_name == "DocumentAttributeAnimated":
+                return "[GIF]"
+
+    return indicators.get(type_name, "[Media]")
+
+
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
 async def get_chats(page: int = 1, page_size: int = 20) -> str:
     """
@@ -365,8 +421,12 @@ async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int =
             reply_info = ""
             if msg.reply_to and msg.reply_to.reply_to_msg_id:
                 reply_info = f" | reply to {msg.reply_to.reply_to_msg_id}"
+            # Build message content with media indicator
+            media_indicator = get_media_indicator(msg.media)
+            text = msg.message or ""
+            content = f"{media_indicator} {text}".strip() if media_indicator or text else "[No content]"
             lines.append(
-                f"ID: {msg.id} | {sender_name} | Date: {msg.date}{reply_info} | Message: {msg.message}"
+                f"ID: {msg.id} | {sender_name} | Date: {msg.date}{reply_info} | Message: {content}"
             )
         return "\n".join(lines)
     except Exception as e:
@@ -770,13 +830,15 @@ async def list_messages(
         lines = []
         for msg in messages:
             sender_name = get_sender_name(msg)
-            message_text = msg.message or "[Media/No text]"
             reply_info = ""
             if msg.reply_to and msg.reply_to.reply_to_msg_id:
                 reply_info = f" | reply to {msg.reply_to.reply_to_msg_id}"
-
+            # Build message content with media indicator
+            media_indicator = get_media_indicator(msg.media)
+            text = msg.message or ""
+            content = f"{media_indicator} {text}".strip() if media_indicator or text else "[No content]"
             lines.append(
-                f"ID: {msg.id} | {sender_name} | Date: {msg.date}{reply_info} | Message: {message_text}"
+                f"ID: {msg.id} | {sender_name} | Date: {msg.date}{reply_info} | Message: {content}"
             )
 
         return "\n".join(lines)
@@ -872,20 +934,35 @@ async def list_topics(
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
-async def list_chats(chat_type: str = None, limit: int = 20) -> str:
+async def list_chats(
+    chat_type: str = None, limit: int = 20, active_within_hours: int = None
+) -> str:
     """
     List available chats with metadata.
 
     Args:
         chat_type: Filter by chat type ('user', 'group', 'channel', or None for all)
         limit: Maximum number of chats to retrieve.
+        active_within_hours: Only include chats with messages within the last N hours.
     """
     try:
         dialogs = await client.get_dialogs(limit=limit)
 
+        # Calculate cutoff time if filtering by activity
+        cutoff_time = None
+        if active_within_hours is not None:
+            cutoff_time = datetime.now(tz=dialogs[0].date.tzinfo if dialogs else None) - timedelta(
+                hours=active_within_hours
+            )
+
         results = []
         for dialog in dialogs:
             entity = dialog.entity
+
+            # Filter by activity time if requested
+            if cutoff_time is not None:
+                if dialog.date is None or dialog.date < cutoff_time:
+                    continue
 
             # Filter by type if requested
             current_type = None
@@ -922,14 +999,22 @@ async def list_chats(chat_type: str = None, limit: int = 20) -> str:
             if hasattr(dialog, "unread_count") and dialog.unread_count > 0:
                 chat_info += f", Unread: {dialog.unread_count}"
 
+            # Add last activity time
+            if dialog.date:
+                chat_info += f", Last activity: {dialog.date.strftime('%Y-%m-%d %H:%M')}"
+
             results.append(chat_info)
 
         if not results:
-            return f"No chats found matching the criteria."
+            if active_within_hours:
+                return f"No chats with activity in the last {active_within_hours} hours."
+            return "No chats found matching the criteria."
 
         return "\n".join(results)
     except Exception as e:
-        return log_and_format_error("list_chats", e, chat_type=chat_type, limit=limit)
+        return log_and_format_error(
+            "list_chats", e, chat_type=chat_type, limit=limit, active_within_hours=active_within_hours
+        )
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
@@ -1205,14 +1290,22 @@ async def get_message_context(
                             replied_sender = getattr(
                                 replied_msg.sender, "first_name", ""
                             ) or getattr(replied_msg.sender, "title", "Unknown")
-                        reply_content = f" | reply to {msg.reply_to.reply_to_msg_id}\n  → Replied message: [{replied_sender}] {replied_msg.message or '[Media/No text]'}"
+                        # Build replied message content with media indicator
+                        replied_media = get_media_indicator(replied_msg.media)
+                        replied_text = replied_msg.message or ""
+                        replied_content = f"{replied_media} {replied_text}".strip() if replied_media or replied_text else "[No content]"
+                        reply_content = f" | reply to {msg.reply_to.reply_to_msg_id}\n  → Replied message: [{replied_sender}] {replied_content}"
                 except Exception:
                     reply_content = (
                         f" | reply to {msg.reply_to.reply_to_msg_id} (original message not found)"
                     )
 
+            # Build message content with media indicator
+            media_indicator = get_media_indicator(msg.media)
+            text = msg.message or ""
+            content = f"{media_indicator} {text}".strip() if media_indicator or text else "[No content]"
             results.append(
-                f"ID: {msg.id} | {sender_name} | {msg.date}{highlight}{reply_content}\n{msg.message or '[Media/No text]'}\n"
+                f"ID: {msg.id} | {sender_name} | {msg.date}{highlight}{reply_content}\n{content}\n"
             )
         return "\n".join(results)
     except Exception as e:
@@ -1562,61 +1655,10 @@ async def get_participants(chat_id: Union[int, str]) -> str:
         return log_and_format_error("get_participants", e, chat_id=chat_id)
 
 
-@mcp.tool(annotations=ToolAnnotations(openWorldHint=True, destructiveHint=True))
-@validate_id("chat_id")
-async def send_file(chat_id: Union[int, str], file_path: str, caption: str = None) -> str:
-    """
-    Send a file to a chat.
-    Args:
-        chat_id: The chat ID or username.
-        file_path: Absolute path to the file to send (must exist and be readable).
-        caption: Optional caption for the file.
-    """
-    try:
-        if not os.path.isfile(file_path):
-            return f"File not found: {file_path}"
-        if not os.access(file_path, os.R_OK):
-            return f"File is not readable: {file_path}"
-        entity = await client.get_entity(chat_id)
-        await client.send_file(entity, file_path, caption=caption)
-        return f"File sent to chat {chat_id}."
-    except Exception as e:
-        return log_and_format_error(
-            "send_file", e, chat_id=chat_id, file_path=file_path, caption=caption
-        )
-
-
-@mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
-@validate_id("chat_id")
-async def download_media(chat_id: Union[int, str], message_id: int, file_path: str) -> str:
-    """
-    Download media from a message in a chat.
-    Args:
-        chat_id: The chat ID or username.
-        message_id: The message ID containing the media.
-        file_path: Absolute path to save the downloaded file (must be writable).
-    """
-    try:
-        entity = await client.get_entity(chat_id)
-        msg = await client.get_messages(entity, ids=message_id)
-        if not msg or not msg.media:
-            return "No media found in the specified message."
-        # Check if directory is writable
-        dir_path = os.path.dirname(file_path) or "."
-        if not os.access(dir_path, os.W_OK):
-            return f"Directory not writable: {dir_path}"
-        await client.download_media(msg, file=file_path)
-        if not os.path.isfile(file_path):
-            return f"Download failed: file not created at {file_path}"
-        return f"Media downloaded to {file_path}."
-    except Exception as e:
-        return log_and_format_error(
-            "download_media",
-            e,
-            chat_id=chat_id,
-            message_id=message_id,
-            file_path=file_path,
-        )
+# File transfer tools (send_file, download_media) have been replaced by HTTP endpoints:
+# - POST /files/send - to send files to Telegram
+# - GET /files/download - to download files from Telegram
+# See the HTTP endpoint handlers below main()
 
 
 @mcp.tool(
@@ -3046,8 +3088,12 @@ async def get_pinned_messages(chat_id: Union[int, str]) -> str:
             reply_info = ""
             if msg.reply_to and msg.reply_to.reply_to_msg_id:
                 reply_info = f" | reply to {msg.reply_to.reply_to_msg_id}"
+            # Build message content with media indicator
+            media_indicator = get_media_indicator(msg.media)
+            text = msg.message or ""
+            content = f"{media_indicator} {text}".strip() if media_indicator or text else "[No content]"
             lines.append(
-                f"ID: {msg.id} | {sender_name} | Date: {msg.date}{reply_info} | Message: {msg.message or '[Media/No text]'}"
+                f"ID: {msg.id} | {sender_name} | Date: {msg.date}{reply_info} | Message: {content}"
             )
 
         return "\n".join(lines)
@@ -3129,8 +3175,113 @@ async def create_poll(
         )
 
 
+# =============================================================================
+# HTTP Endpoints for File Transfer
+# =============================================================================
+
+
+async def download_file_endpoint(request: Request) -> Response:
+    """
+    HTTP endpoint to download media from Telegram.
+    GET /files/download?chat_id=123&message_id=456
+    Returns: file bytes streamed directly
+    """
+    chat_id = request.query_params.get("chat_id")
+    message_id = request.query_params.get("message_id")
+
+    if not chat_id or not message_id:
+        return JSONResponse({"error": "chat_id and message_id required"}, status_code=400)
+
+    try:
+        # Parse chat_id (can be int or username)
+        parsed_chat_id = int(chat_id) if chat_id.lstrip('-').isdigit() else chat_id
+        entity = await client.get_entity(parsed_chat_id)
+        msg = await client.get_messages(entity, ids=int(message_id))
+
+        if not msg or not msg.media:
+            return JSONResponse({"error": "No media found in the specified message"}, status_code=404)
+
+        # Get filename from media
+        filename = None
+        if hasattr(msg.media, 'document') and msg.media.document:
+            for attr in msg.media.document.attributes:
+                if hasattr(attr, 'file_name'):
+                    filename = attr.file_name
+                    break
+        if not filename:
+            filename = f"file_{message_id}"
+
+        # Determine mime type
+        mime_type, _ = mimetypes.guess_type(filename)
+        mime_type = mime_type or "application/octet-stream"
+
+        # Download to BytesIO and return
+        buffer = io.BytesIO()
+        await client.download_media(msg, file=buffer)
+        buffer.seek(0)
+
+        return Response(
+            content=buffer.read(),
+            media_type=mime_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        )
+    except Exception as e:
+        logger.exception(f"download_file_endpoint failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def send_file_endpoint(request: Request) -> Response:
+    """
+    HTTP endpoint to send a file to Telegram.
+    POST /files/send?chat_id=123&filename=doc.pdf&caption=Hello
+    Body: raw file bytes
+    Returns: {"success": true}
+    """
+    chat_id = request.query_params.get("chat_id")
+    filename = request.query_params.get("filename", "file")
+    caption = request.query_params.get("caption")
+
+    if not chat_id:
+        return JSONResponse({"error": "chat_id required"}, status_code=400)
+
+    body = await request.body()
+    if len(body) > MAX_FILE_SIZE:
+        return JSONResponse(
+            {"error": f"File too large (max {MAX_FILE_SIZE // (1024*1024)}MB)"},
+            status_code=413
+        )
+
+    if len(body) == 0:
+        return JSONResponse({"error": "Empty file body"}, status_code=400)
+
+    try:
+        # Parse chat_id (can be int or username)
+        parsed_chat_id = int(chat_id) if chat_id.lstrip('-').isdigit() else chat_id
+        entity = await client.get_entity(parsed_chat_id)
+
+        # Send directly from BytesIO
+        buffer = io.BytesIO(body)
+        buffer.name = filename  # Telethon uses this for the filename
+        await client.send_file(entity, buffer, caption=caption)
+
+        return JSONResponse({"success": True, "message": f"File '{filename}' sent to {chat_id}"})
+    except Exception as e:
+        logger.exception(f"send_file_endpoint failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
 if __name__ == "__main__":
     nest_asyncio.apply()
+
+    # Configure MCP server for SSE transport
+    mcp.settings.host = MCP_HOST
+    mcp.settings.port = MCP_PORT
+    mcp.settings.sse_path = f"{MCP_PATH_PREFIX}/sse"
+    mcp.settings.message_path = f"{MCP_PATH_PREFIX}/messages/"
 
     async def main() -> None:
         try:
@@ -3138,9 +3289,27 @@ if __name__ == "__main__":
             print("Starting Telegram client...")
             await client.start()
 
-            print("Telegram client started. Running MCP server...")
-            # Use the asynchronous entrypoint instead of mcp.run()
-            await mcp.run_stdio_async()
+            # Get the base MCP SSE app
+            base_app = mcp.sse_app()
+
+            # Create extended app with file transfer HTTP endpoints
+            app = Starlette(
+                debug=False,
+                routes=[
+                    Route("/files/download", download_file_endpoint, methods=["GET"]),
+                    Route("/files/send", send_file_endpoint, methods=["POST"]),
+                    Mount("/", app=base_app),
+                ],
+            )
+
+            print(f"Telegram client started. Running server on http://{mcp.settings.host}:{mcp.settings.port}...")
+            print("HTTP endpoints available:")
+            print("  - GET  /files/download?chat_id=...&message_id=...")
+            print("  - POST /files/send?chat_id=...&filename=...&caption=...")
+
+            config = uvicorn.Config(app, host=mcp.settings.host, port=mcp.settings.port)
+            server = uvicorn.Server(config)
+            await server.serve()
         except Exception as e:
             print(f"Error starting client: {e}", file=sys.stderr)
             if isinstance(e, sqlite3.OperationalError) and "database is locked" in str(e):
