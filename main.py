@@ -78,8 +78,21 @@ MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB max file size for HTTP transfers
 MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.getenv("MCP_PORT", "8080"))
 MCP_PATH_PREFIX = os.getenv("MCP_PATH_PREFIX", "/mcp")  # Secret path prefix for security
+MCP_ALLOWED_HOSTS = os.getenv("MCP_ALLOWED_HOSTS", "")  # Comma-separated list of allowed hosts
 
 mcp = FastMCP("telegram")
+
+# Configure transport security for external access
+if MCP_ALLOWED_HOSTS:
+    from mcp.server.transport_security import TransportSecuritySettings
+    allowed_hosts = [h.strip() for h in MCP_ALLOWED_HOSTS.split(",") if h.strip()]
+    # Add localhost variants for local testing
+    allowed_hosts.extend(["127.0.0.1:*", "localhost:*", "[::1]:*"])
+    mcp.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=[],  # Allow any origin since we use secret path for security
+    )
 
 if SESSION_STRING:
     # Use the string session if available
@@ -3280,8 +3293,6 @@ if __name__ == "__main__":
     # Configure MCP server for SSE transport
     mcp.settings.host = MCP_HOST
     mcp.settings.port = MCP_PORT
-    mcp.settings.sse_path = f"{MCP_PATH_PREFIX}/sse"
-    mcp.settings.message_path = f"{MCP_PATH_PREFIX}/messages/"
 
     async def main() -> None:
         try:
@@ -3293,12 +3304,13 @@ if __name__ == "__main__":
             base_app = mcp.sse_app()
 
             # Create extended app with file transfer HTTP endpoints
+            # Mount MCP app at the secret path prefix for security
             app = Starlette(
                 debug=False,
                 routes=[
                     Route("/files/download", download_file_endpoint, methods=["GET"]),
                     Route("/files/send", send_file_endpoint, methods=["POST"]),
-                    Mount("/", app=base_app),
+                    Mount(MCP_PATH_PREFIX, app=base_app),
                 ],
             )
 
