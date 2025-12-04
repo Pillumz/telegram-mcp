@@ -3233,10 +3233,14 @@ async def download_file_endpoint(request: Request) -> Response:
         await client.download_media(msg, file=buffer)
         buffer.seek(0)
 
+        # Use RFC 5987 encoding for non-ASCII filenames
+        from urllib.parse import quote
+        encoded_filename = quote(filename)
+
         return Response(
             content=buffer.read(),
             media_type=mime_type,
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"}
         )
     except Exception as e:
         logger.exception(f"download_file_endpoint failed: {e}")
