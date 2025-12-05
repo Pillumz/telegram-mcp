@@ -1668,10 +1668,102 @@ async def get_participants(chat_id: Union[int, str]) -> str:
         return log_and_format_error("get_participants", e, chat_id=chat_id)
 
 
-# File transfer tools (send_file, download_media) have been replaced by HTTP endpoints:
-# - POST /files/send - to send files to Telegram
-# - GET /files/download - to download files from Telegram
-# See the HTTP endpoint handlers below main()
+@mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
+@validate_id("chat_id")
+async def get_media_download_url(chat_id: Union[int, str], message_id: int) -> str:
+    """
+    Get a URL to download media from a message.
+    The returned URL can be fetched directly via HTTP GET to download the file.
+
+    Args:
+        chat_id: The chat ID or username.
+        message_id: The message ID containing the media.
+
+    Returns:
+        URL to download the media file, or error message if no media found.
+    """
+    try:
+        entity = await client.get_entity(chat_id)
+        msg = await client.get_messages(entity, ids=message_id)
+
+        if not msg or not msg.media:
+            return "No media found in the specified message."
+
+        # Get media info
+        media_indicator = get_media_indicator(msg.media)
+        filename = None
+        if hasattr(msg.media, 'document') and msg.media.document:
+            for attr in msg.media.document.attributes:
+                if hasattr(attr, 'file_name'):
+                    filename = attr.file_name
+                    break
+
+        # Build the download URL - use chat_id as provided (username or ID)
+        chat_param = chat_id if isinstance(chat_id, str) else str(chat_id)
+        download_url = f"/files/download?chat_id={chat_param}&message_id={message_id}"
+
+        result = f"Media type: {media_indicator}\n"
+        if filename:
+            result += f"Filename: {filename}\n"
+        result += f"Download URL: {download_url}\n"
+        result += "\nUse HTTP GET on the download URL to fetch the file."
+
+        return result
+    except Exception as e:
+        return log_and_format_error(
+            "get_media_download_url", e, chat_id=chat_id, message_id=message_id
+        )
+
+
+@mcp.tool(annotations=ToolAnnotations(openWorldHint=True, destructiveHint=True))
+@validate_id("chat_id")
+async def send_file_from_url(chat_id: Union[int, str], file_url: str, filename: str = None, caption: str = None) -> str:
+    """
+    Download a file from a URL and send it to a Telegram chat.
+
+    Args:
+        chat_id: The chat ID or username.
+        file_url: URL to download the file from.
+        filename: Optional filename to use (otherwise extracted from URL).
+        caption: Optional caption for the file.
+
+    Returns:
+        Success message or error.
+    """
+    try:
+        import httpx
+
+        # Extract filename from URL if not provided
+        if not filename:
+            from urllib.parse import urlparse, unquote
+            parsed = urlparse(file_url)
+            filename = unquote(parsed.path.split('/')[-1]) or "file"
+
+        # Download the file
+        async with httpx.AsyncClient(timeout=60.0) as http_client:
+            response = await http_client.get(file_url)
+            response.raise_for_status()
+            file_bytes = response.content
+
+        if len(file_bytes) > MAX_FILE_SIZE:
+            return f"File too large (max {MAX_FILE_SIZE // (1024*1024)}MB)"
+
+        if len(file_bytes) == 0:
+            return "Downloaded file is empty"
+
+        # Send to Telegram
+        entity = await client.get_entity(chat_id)
+        buffer = io.BytesIO(file_bytes)
+        buffer.name = filename
+        await client.send_file(entity, buffer, caption=caption)
+
+        return f"File '{filename}' ({len(file_bytes)} bytes) sent to {chat_id}."
+    except httpx.HTTPError as e:
+        return f"Failed to download file from URL: {e}"
+    except Exception as e:
+        return log_and_format_error(
+            "send_file_from_url", e, chat_id=chat_id, file_url=file_url, filename=filename
+        )
 
 
 @mcp.tool(
