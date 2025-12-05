@@ -79,6 +79,7 @@ MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.getenv("MCP_PORT", "8080"))
 MCP_PATH_PREFIX = os.getenv("MCP_PATH_PREFIX", "/mcp")  # Secret path prefix for security
 MCP_ALLOWED_HOSTS = os.getenv("MCP_ALLOWED_HOSTS", "")  # Comma-separated list of allowed hosts
+MCP_PUBLIC_URL = os.getenv("MCP_PUBLIC_URL", "")  # Public base URL for file endpoints (e.g., https://example.com/mcp/SECRET)
 
 mcp = FastMCP("telegram")
 
@@ -1668,6 +1669,31 @@ async def get_participants(chat_id: Union[int, str]) -> str:
         return log_and_format_error("get_participants", e, chat_id=chat_id)
 
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_file_endpoints() -> dict:
+    """
+    Get HTTP file transfer endpoint URLs for downloading and uploading files.
+
+    Use these endpoints to transfer files between the agent's local machine and Telegram.
+
+    Returns:
+        Dictionary with download and send endpoint URLs and usage instructions.
+    """
+    if MCP_PUBLIC_URL:
+        base = MCP_PUBLIC_URL
+    else:
+        base = f"http://{MCP_HOST}:{MCP_PORT}{MCP_PATH_PREFIX}"
+
+    return {
+        "download_url": f"{base}/files/download",
+        "send_url": f"{base}/files/send",
+        "usage": {
+            "download": "GET {download_url}?chat_id=<chat_id>&message_id=<message_id> -> returns file bytes",
+            "send": "POST {send_url}?chat_id=<chat_id>&filename=<name>&caption=<optional> with raw file bytes as body -> sends file to chat"
+        }
+    }
+
+
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True, readOnlyHint=True))
 @validate_id("chat_id")
 async def get_media_download_url(chat_id: Union[int, str], message_id: int) -> str:
@@ -1700,13 +1726,20 @@ async def get_media_download_url(chat_id: Union[int, str], message_id: int) -> s
 
         # Build the download URL - use chat_id as provided (username or ID)
         chat_param = chat_id if isinstance(chat_id, str) else str(chat_id)
-        download_url = f"/files/download?chat_id={chat_param}&message_id={message_id}"
+        # Use MCP_PUBLIC_URL for full external URL, otherwise relative path with prefix
+        if MCP_PUBLIC_URL:
+            download_url = f"{MCP_PUBLIC_URL}/files/download?chat_id={chat_param}&message_id={message_id}"
+        else:
+            download_url = f"{MCP_PATH_PREFIX}/files/download?chat_id={chat_param}&message_id={message_id}"
 
         result = f"Media type: {media_indicator}\n"
         if filename:
             result += f"Filename: {filename}\n"
         result += f"Download URL: {download_url}\n"
-        result += "\nUse HTTP GET on the download URL to fetch the file."
+        if MCP_PUBLIC_URL:
+            result += "\nUse HTTP GET on the download URL to fetch the file."
+        else:
+            result += "\nUse HTTP GET on the download URL (prepend server base URL) to fetch the file."
 
         return result
     except Exception as e:
@@ -3400,20 +3433,20 @@ if __name__ == "__main__":
             base_app = mcp.sse_app()
 
             # Create extended app with file transfer HTTP endpoints
-            # Mount MCP app at the secret path prefix for security
+            # Mount file endpoints under MCP_PATH_PREFIX for security (inherits Caddy's secret path + IP allowlist)
             app = Starlette(
                 debug=False,
                 routes=[
-                    Route("/files/download", download_file_endpoint, methods=["GET"]),
-                    Route("/files/send", send_file_endpoint, methods=["POST"]),
+                    Route(f"{MCP_PATH_PREFIX}/files/download", download_file_endpoint, methods=["GET"]),
+                    Route(f"{MCP_PATH_PREFIX}/files/send", send_file_endpoint, methods=["POST"]),
                     Mount(MCP_PATH_PREFIX, app=base_app),
                 ],
             )
 
             print(f"Telegram client started. Running server on http://{mcp.settings.host}:{mcp.settings.port}...")
-            print("HTTP endpoints available:")
-            print("  - GET  /files/download?chat_id=...&message_id=...")
-            print("  - POST /files/send?chat_id=...&filename=...&caption=...")
+            print(f"HTTP file endpoints (under {MCP_PATH_PREFIX}):")
+            print(f"  - GET  {MCP_PATH_PREFIX}/files/download?chat_id=...&message_id=...")
+            print(f"  - POST {MCP_PATH_PREFIX}/files/send?chat_id=...&filename=...&caption=...")
 
             config = uvicorn.Config(app, host=mcp.settings.host, port=mcp.settings.port)
             server = uvicorn.Server(config)
