@@ -1,0 +1,16 @@
+[Unit]
+Description=telegram-mcp MCP Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/mcp/telegram-mcp
+EnvironmentFile=/opt/mcp/telegram-mcp/.env
+ExecStart=/opt/mcp/telegram-mcp/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
