@@ -1,4 +1,6 @@
-# Telegram MCP Server
+# telegram-mcp
+
+> **Fork Notice:** This is a fork of [chigwell/telegram-mcp](https://github.com/chigwell/telegram-mcp) with modifications for systemd deployment. See upstream for original documentation.
 
 ![MCP Badge](https://badge.mcpx.dev)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-green?style=flat-square)](https://opensource.org/licenses/Apache-2.0)
